@@ -89,6 +89,7 @@ jobs:
 
       - name: Install SDK components
         run: |
+          export PATH="$(ls -d /usr/local/lib/android/sdk/cmdline-tools/*/bin | head -1):$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
             "platform-tools" \
@@ -216,6 +217,7 @@ jobs:
 
       - name: Install SDK components
         run: |
+          export PATH="$(ls -d /usr/local/lib/android/sdk/cmdline-tools/*/bin | head -1):$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
             "platforms;android-${{ steps.pins.outputs.compile_sdk }}" \
