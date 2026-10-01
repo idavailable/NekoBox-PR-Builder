@@ -294,7 +294,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NekoBox-PR${{ inputs.pr }}-${{ inputs.abi }}
-          path: ${{ env.SRC }}/../out/*.apk
+          path: out/*.apk
           if-no-files-found: error
 
       - name: Publish release
