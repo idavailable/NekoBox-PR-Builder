@@ -1,0 +1,296 @@
+name: Build NekoBox APK from PR
+
+# Single-file, self-contained. No helper scripts needed.
+# Create only ONE file: .github/workflows/build.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "NekoBoxForAndroid PR number"
+        required: true
+        default: "1213"
+      abi:
+        description: "Target ABI (single-ABI build, ~4x faster)"
+        required: true
+        default: "arm64-v8a"
+        type: choice
+        options: [arm64-v8a, armeabi-v7a, x86_64, x86]
+      flavor:
+        description: "Gradle product flavor"
+        required: true
+        default: "preview"
+        type: choice
+        options: [preview, oss, fdroid]
+      go_version:
+        description: "Go version (leave empty = read from libcore/go.mod)"
+        required: false
+        default: ""
+      release_tag:
+        description: "Publish to Release with this tag (empty = artifact only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: MatsuriDayo/NekoBoxForAndroid
+  SRC: neko
+
+jobs:
+  libcore:
+    name: Core (Go to libcore.aar)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          fetch-depth: 1
+          path: ${{ env.SRC }}
+
+      - name: Fetch PR #${{ inputs.pr }}
+        working-directory: ${{ env.SRC }}
+        run: |
+          git fetch origin "pull/${{ inputs.pr }}/head:pr-${{ inputs.pr }}"
+          git checkout "pr-${{ inputs.pr }}"
+          echo "PR_HEAD=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          git log --oneline -5
+
+      - name: Resolve toolchain pins declared by the PR
+        id: pins
+        working-directory: ${{ env.SRC }}
+        run: |
+          NDK=$(grep -oE 'ndk/[0-9.]+' buildScript/init/env_ndk.sh | head -1 | cut -d/ -f2)
+          SDK=$(grep -oE 'compileSdk = [0-9]+' buildSrc/src/main/kotlin/Helpers.kt | head -1 | grep -oE '[0-9]+')
+          BT=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' buildSrc/src/main/kotlin/Helpers.kt | head -1 | tr -d '"')
+          for v in "NDK:$NDK" "SDK:$SDK" "BT:$BT"; do
+            [ -n "${v#*:}" ] || { echo "pin detection failed: $v"; exit 1; }
+          done
+          echo "ndk=$NDK" >> $GITHUB_OUTPUT
+          echo "compile_sdk=$SDK" >> $GITHUB_OUTPUT
+          echo "build_tools=$BT" >> $GITHUB_OUTPUT
+          echo "Resolved from PR: NDK=$NDK compileSdk=$SDK buildTools=$BT"
+
+      - name: Set up Go (from libcore/go.mod)
+        if: inputs.go_version == ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.SRC }}/libcore/go.mod
+          cache-dependency-path: ${{ env.SRC }}/libcore/go.sum
+
+      - name: Set up Go (pinned)
+        if: inputs.go_version != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache-dependency-path: ${{ env.SRC }}/libcore/go.sum
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.1
+
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${{ steps.pins.outputs.compile_sdk }}" \
+            "build-tools;${{ steps.pins.outputs.build_tools }}" \
+            "ndk;${{ steps.pins.outputs.ndk }}"
+
+      - name: Pin single ABI
+        working-directory: ${{ env.SRC }}
+        env:
+          TARGET_ABI: ${{ inputs.abi }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          abi = os.environ["TARGET_ABI"]
+          targets = {
+              "arm64-v8a": "android/arm64",
+              "armeabi-v7a": "android/arm",
+              "x86_64": "android/amd64",
+              "x86": "android/386",
+          }
+          arch = targets[abi]
+
+          # 1. gomobile bind -> one arch only
+          p = "libcore/build.sh"
+          s = open(p).read()
+          s = re.sub(r"-target=\S+\s", "", s)
+          needle = "gomobile-matsuri bind "
+          assert needle in s, "unexpected libcore/build.sh layout"
+          open(p, "w").write(s.replace(needle, f"{needle}-target={arch} ", 1))
+          print(f"[abi] gomobile -> {arch}")
+
+          # 2. Gradle splits.abi -> keep our ABI only
+          p = "buildSrc/src/main/kotlin/Helpers.kt"
+          s = open(p).read()
+          before = len(re.findall(r"^\s*include$", s, flags=re.M))
+          for other in targets:
+              if other != abi:
+                  s = re.sub(r'^\s*include\(\s*"%s"\s*$\s*\n' % other, "", s, flags=re.M)
+          after = len(re.findall(r"^\s*include$", s, flags=re.M))
+          assert after == 1, f"expected exactly 1 include(), got {after}"
+          assert f'"{abi}"' in s, f"{abi} missing from splits.abi"
+          open(p, "w").write(s)
+          print(f"[abi] gradle splits -> {abi} only (was {before})")
+          PY
+
+      - name: Restore core cache
+        id: core_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC }}/app/libs/libcore.aar
+          key: libcore-${{ inputs.pr }}-${{ env.PR_HEAD }}-${{ inputs.abi }}-${{ hashFiles('neko/libcore/go.mod') }}
+
+      - name: Build core (gomobile bind)
+        if: steps.core_cache.outputs.cache-hit != 'true'
+        working-directory: ${{ env.SRC }}
+        env:
+          ANDROID_NDK_HOME: ${{ format('{0}/ndk/{1}', env.ANDROID_HOME, steps.pins.outputs.ndk) }}
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          ./run lib core
+
+      - name: Upload core
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcore-aar-${{ inputs.abi }}
+          path: ${{ env.SRC }}/app/libs/libcore.aar
+          if-no-files-found: error
+
+  apk:
+    name: APK
+    needs: libcore
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          fetch-depth: 1
+          path: ${{ env.SRC }}
+
+      - name: Fetch PR #${{ inputs.pr }}
+        working-directory: ${{ env.SRC }}
+        run: |
+          git fetch origin "pull/${{ inputs.pr }}/head:pr-${{ inputs.pr }}"
+          git checkout "pr-${{ inputs.pr }}"
+          echo "PR_HEAD=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Resolve toolchain pins
+        id: pins
+        working-directory: ${{ env.SRC }}
+        run: |
+          echo "ndk=$(grep -oE 'ndk/[0-9.]+' buildScript/init/env_ndk.sh | head -1 | cut -d/ -f2)" >> $GITHUB_OUTPUT
+          echo "compile_sdk=$(grep -oE 'compileSdk = [0-9]+' buildSrc/src/main/kotlin/Helpers.kt | head -1 | grep -oE '[0-9]+')" >> $GITHUB_OUTPUT
+          echo "build_tools=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' buildSrc/src/main/kotlin/Helpers.kt | head -1 | tr -d '"')" >> $GITHUB_OUTPUT
+
+      - name: Pin single ABI
+        working-directory: ${{ env.SRC }}
+        env:
+          TARGET_ABI: ${{ inputs.abi }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          abi = os.environ["TARGET_ABI"]
+          all_abi = ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"]
+          p = "buildSrc/src/main/kotlin/Helpers.kt"
+          s = open(p).read()
+          for other in all_abi:
+              if other != abi:
+                  s = re.sub(r'^\s*include\(\s*"%s"\s*$\s*\n' % other, "", s, flags=re.M)
+          after = len(re.findall(r"^\s*include\(", s, flags=re.M))
+          assert after == 1, f"expected exactly 1 include(), got {after}"
+          assert f'"{abi}"' in s, f"{abi} missing from splits.abi"
+          open(p, "w").write(s)
+          print(f"[abi] gradle splits -> {abi} only")
+          PY
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.1
+
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platforms;android-${{ steps.pins.outputs.compile_sdk }}" \
+            "build-tools;${{ steps.pins.outputs.build_tools }}"
+
+      - name: Restore core
+        uses: actions/download-artifact@v4
+        with:
+          name: libcore-aar-${{ inputs.abi }}
+          path: ${{ env.SRC }}/app/libs
+
+      - name: Restore signing keystore
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC }}/release.keystore
+          key: neko-pr-release-keystore-v1
+
+      - name: Prepare signing
+        working-directory: ${{ env.SRC }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+          fi
+          if [ ! -s release.keystore ]; then
+            keytool -genkeypair -keystore release.keystore -storetype JKS \
+              -alias neko -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass nekopass -keypass nekopass \
+              -dname "CN=NekoBox PR Build, OU=Build, O=NekoBox, C=CN"
+          fi
+          echo "KEYSTORE_PASS=nekopass" >> $GITHUB_ENV
+          echo "ALIAS_NAME=neko" >> $GITHUB_ENV
+          echo "ALIAS_PASS=nekopass" >> $GITHUB_ENV
+
+      - name: Download assets (geoip / geosite)
+        working-directory: ${{ env.SRC }}
+        run: ./run init action gradle
+
+      - name: Gradle assemble
+        working-directory: ${{ env.SRC }}
+        env:
+          BUILD_PLUGIN: none
+        run: |
+          F="${{ inputs.flavor }}"
+          TASK="app:assemble$(echo ${F:0:1} | tr a-z A-Z)${F:1}Release"
+          echo ">>> $TASK"
+          ./gradlew "$TASK" --no-daemon
+
+      - name: Collect APK
+        working-directory: ${{ env.SRC }}
+        run: |
+          APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
+          [ -n "$APK" ] || { echo "no APK produced"; exit 1; }
+          mkdir -p ../out
+          cp "$APK" "../out/NekoBox-PR${{ inputs.pr }}-${{ env.PR_HEAD }}-${{ inputs.abi }}.apk"
+          ls -lh ../out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NekoBox-PR${{ inputs.pr }}-${{ inputs.abi }}
+          path: ${{ env.SRC }}/../out/*.apk
+          if-no-files-found: error
+
+      - name: Publish release
+        if: inputs.release_tag != ''
+        working-directory: ${{ env.SRC }}/../out
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ inputs.release_tag }}" *.apk --generate-notes
