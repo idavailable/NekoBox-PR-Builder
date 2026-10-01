@@ -103,38 +103,48 @@ jobs:
           TARGET_ABI: ${{ inputs.abi }}
         run: |
           python3 - <<'PY'
-          import os, re
+          import os
 
           abi = os.environ["TARGET_ABI"]
-          targets = {
+          archmap = {
               "arm64-v8a": "android/arm64",
               "armeabi-v7a": "android/arm",
               "x86_64": "android/amd64",
               "x86": "android/386",
           }
-          arch = targets[abi]
+          arch = archmap[abi]
 
-          # 1. gomobile bind -> one arch only
+          # 1. gomobile bind -> one arch only (token-level edit, no regex)
           p = "libcore/build.sh"
           s = open(p).read()
-          s = re.sub(r"-target=\S+\s", "", s)
           needle = "gomobile-matsuri bind "
-          assert needle in s, "unexpected libcore/build.sh layout"
-          open(p, "w").write(s.replace(needle, f"{needle}-target={arch} ", 1))
-          print(f"[abi] gomobile -> {arch}")
+          assert needle in s, "gomobile bind line not found in libcore/build.sh"
+          head, tail = s.split(needle, 1)
+          toks = [t for t in tail.split(" ") if not t.startswith("-target=")]
+          open(p, "w").write(head + needle + "-target=" + arch + " " + " ".join(toks))
+          print("[abi] gomobile -> " + arch)
 
-          # 2. Gradle splits.abi -> keep our ABI only
+          # 2. Gradle splits.abi -> keep our ABI only (line-level edit, no regex)
           p = "buildSrc/src/main/kotlin/Helpers.kt"
-          s = open(p).read()
-          before = len(re.findall(r"^\s*include$", s, flags=re.M))
-          for other in targets:
-              if other != abi:
-                  s = re.sub(r'^\s*include\(\s*"%s"\s*$\s*\n' % other, "", s, flags=re.M)
-          after = len(re.findall(r"^\s*include$", s, flags=re.M))
-          assert after == 1, f"expected exactly 1 include(), got {after}"
-          assert f'"{abi}"' in s, f"{abi} missing from splits.abi"
-          open(p, "w").write(s)
-          print(f"[abi] gradle splits -> {abi} only (was {before})")
+          lines = open(p).read().splitlines(True)
+          keep = []
+          removed = 0
+          for ln in lines:
+              t = ln.strip()
+              if t.startswith("include(") and t.endswith(")"):
+                  inner = t[len("include("):-1].strip().strip('"')
+                  if inner != abi:
+                      removed += 1
+                      continue
+              keep.append(ln)
+          if removed != 3:
+              print("DEBUG: lines containing include/splits in Helpers.kt:")
+              for i, ln in enumerate(lines):
+                  if ("include" in ln) or ("splits" in ln):
+                      print("  line " + str(i) + ": " + ln.rstrip())
+          assert removed == 3, "expected to drop 3 include lines, dropped " + str(removed)
+          open(p, "w").write("".join(keep))
+          print("[abi] gradle splits -> " + abi + " only")
           PY
 
       - name: Restore core cache
@@ -193,20 +203,29 @@ jobs:
           TARGET_ABI: ${{ inputs.abi }}
         run: |
           python3 - <<'PY'
-          import os, re
+          import os
 
           abi = os.environ["TARGET_ABI"]
-          all_abi = ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"]
           p = "buildSrc/src/main/kotlin/Helpers.kt"
-          s = open(p).read()
-          for other in all_abi:
-              if other != abi:
-                  s = re.sub(r'^\s*include\(\s*"%s"\s*$\s*\n' % other, "", s, flags=re.M)
-          after = len(re.findall(r"^\s*include\(", s, flags=re.M))
-          assert after == 1, f"expected exactly 1 include(), got {after}"
-          assert f'"{abi}"' in s, f"{abi} missing from splits.abi"
-          open(p, "w").write(s)
-          print(f"[abi] gradle splits -> {abi} only")
+          lines = open(p).read().splitlines(True)
+          keep = []
+          removed = 0
+          for ln in lines:
+              t = ln.strip()
+              if t.startswith("include(") and t.endswith(")"):
+                  inner = t[len("include("):-1].strip().strip('"')
+                  if inner != abi:
+                      removed += 1
+                      continue
+              keep.append(ln)
+          if removed != 3:
+              print("DEBUG: lines containing include/splits in Helpers.kt:")
+              for i, ln in enumerate(lines):
+                  if ("include" in ln) or ("splits" in ln):
+                      print("  line " + str(i) + ": " + ln.rstrip())
+          assert removed == 3, "expected to drop 3 include lines, dropped " + str(removed)
+          open(p, "w").write("".join(keep))
+          print("[abi] gradle splits -> " + abi + " only")
           PY
 
       - name: Set up JDK 21
