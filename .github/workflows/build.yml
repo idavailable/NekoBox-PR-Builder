@@ -87,9 +87,6 @@ jobs:
           go-version: ${{ inputs.go_version }}
           cache-dependency-path: ${{ env.SRC }}/libcore/go.sum
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4.0.1
-
       - name: Install SDK components
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
@@ -216,9 +213,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4.0.1
 
       - name: Install SDK components
         run: |
